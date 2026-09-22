@@ -978,7 +978,17 @@ class DefaultModelLoader(BaseModelLoader):
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
         with set_default_torch_dtype(model_config.dtype):
-            with target_device:
+            architectures = set(
+                getattr(model_config.hf_config, "architectures", None) or ()
+            )
+            stage_minicpm_on_cpu = target_device.type == "xpu" and bool(
+                architectures
+                & {"MiniCPMO", "MiniCPMV", "MiniCPMV4_6ForConditionalGeneration"}
+            )
+            # MiniCPM's per-tensor CPU-to-XPU copies during weight loading are
+            # extremely slow. Build and load on CPU, then move the model once.
+            init_device = torch.device("cpu") if stage_minicpm_on_cpu else target_device
+            with init_device:
                 model = _initialize_model(
                     model_config,
                     self.load_config,
@@ -986,8 +996,10 @@ class DefaultModelLoader(BaseModelLoader):
                 )
 
             self.load_weights_and_postprocess(
-                model, self._get_all_weights(model_config, model), target_device
+                model, self._get_all_weights(model_config, model), init_device
             )
+            if init_device != target_device:
+                model = model.to(target_device)
 
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
